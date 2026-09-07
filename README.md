@@ -1,4 +1,4 @@
-# ReveseEngBench
+# SREBench
 
 A single-domain reverse-engineering benchmark: a coding agent is given a stripped-down, encoder-only file compressor and must reverse the format and recover the original inputs, scored 0–6.
 
