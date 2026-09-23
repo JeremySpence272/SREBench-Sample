@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import secrets
+import stat
 import subprocess
 import tempfile
 
@@ -15,11 +17,139 @@ def evaluate(config, challenge_dir, submission_dir, reasoning_file, agent):
         "additional_info": dict,
     }
     """
-    eval_type = config["evaluation"]
-    if eval_type == "revdeflate_score":
+    # `eval/test.sh` is the universal grader entrypoint. When `evaluation` is
+    # omitted (or "artifact_test"/"binary"), the run is graded by its EXIT CODE
+    # (0 == correct) — the default, covering any test you can script. A named
+    # value opts into a grader that interprets the run differently (e.g. parses a
+    # result file for partial scoring); see revdeflate_score.
+    eval_type = config.get("evaluation") or "artifact_test"
+    if eval_type in ("artifact_test", "binary"):
+        return artifact_test(config, challenge_dir, submission_dir)
+    elif eval_type == "revdeflate_score":
         return revdeflate_score(config, challenge_dir, submission_dir)
     else:
         raise ValueError(f"unknown evaluation type: {eval_type}")
+
+
+# ── Generic grader: run eval/test.sh, exit code == pass/fail ──
+
+EVAL_DOCKERFILE = """\
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    python3 python3-pip \\
+    gcc libc6-dev \\
+    socat openssl iptables sudo xxd jq ca-certificates \\
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /challenge
+"""
+
+_eval_image_tag = None
+
+
+def _get_eval_image():
+    """Return the generic eval image tag, building it if needed."""
+    global _eval_image_tag
+    if _eval_image_tag is not None:
+        return _eval_image_tag
+    digest = hashlib.sha256(EVAL_DOCKERFILE.encode()).hexdigest()[:12]
+    tag = f"srebench-eval-{digest}"
+    if subprocess.run(
+        ["docker", "image", "inspect", tag], capture_output=True
+    ).returncode != 0:
+        print(f"Building eval image {tag}...")
+        subprocess.run(
+            ["docker", "build", "-t", tag, "-"],
+            input=EVAL_DOCKERFILE.encode(),
+            check=True,
+        )
+    _eval_image_tag = tag
+    return tag
+
+
+def _privilege_args(config):
+    """Docker privilege flags from the per-challenge `eval` block.
+
+    Defaults to `--privileged`; opt out with `eval.privileged: false` plus
+    optional `eval.cap_add` / `eval.security_opt`.
+    """
+    ev = (config or {}).get("eval") or {}
+    if ev.get("privileged", True):
+        return ["--privileged"]
+    args = []
+    for cap in ev.get("cap_add", []) or []:
+        args += ["--cap-add", cap]
+    for opt in ev.get("security_opt", []) or []:
+        args += ["--security-opt", opt]
+    return args
+
+
+def artifact_test(config, challenge_dir, submission_dir):
+    """Generic pass/fail grader — the default.
+
+    Runs the challenge's `eval/test.sh` in an isolated container with the
+    challenge tree at /challenge and the agent's submission at /submission (also
+    env SUBMISSION_DIR). Pass/fail is the script's EXIT CODE: 0 == correct.
+
+    For graded/partial scoring, write your own grader (see revdeflate_score) that
+    parses a result file, and add a dispatch case in evaluate() above.
+    """
+    script = os.path.join(challenge_dir, "eval", "test.sh")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"test script not found: {script}")
+    if not os.access(script, os.X_OK):
+        os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR)
+
+    eval_image = _get_eval_image()
+    challenge_dir = os.path.abspath(challenge_dir)
+    submission_dir = os.path.abspath(submission_dir)
+    timeout = int((config or {}).get("eval", {}).get("timeout", 3600))
+
+    container_name = f"srebench-eval-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        subprocess.run(
+            [
+                "docker", "create", "--name", container_name,
+                *_privilege_args(config),
+                "-e", "SUBMISSION_DIR=/submission",
+                eval_image, "/challenge/eval/test.sh",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["docker", "cp", f"{challenge_dir}/.", f"{container_name}:/challenge"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["docker", "cp", f"{submission_dir}/.", f"{container_name}:/submission"],
+            check=True,
+            capture_output=True,
+        )
+        result = subprocess.run(
+            ["docker", "start", "-a", container_name],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    finally:
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+
+    try:
+        artifacts = sorted(os.listdir(submission_dir))
+    except OSError:
+        artifacts = []
+
+    return {
+        "correct": result.returncode == 0,
+        "additional_info": {
+            "exit_code": result.returncode,
+            "stdout": result.stdout.strip()[-2000:] if result.stdout else "",
+            "stderr": result.stderr.strip()[-2000:] if result.stderr else "",
+            "artifacts": artifacts,
+        },
+    }
 
 
 _revdeflate_grader_tag = None
