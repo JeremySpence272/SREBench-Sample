@@ -18,12 +18,19 @@ from step_budget import over_budget  # noqa: E402
 REASONING_PATH = "/workspace/reasoning.jsonl"
 RESULT_PATH = "/workspace/result.json"
 
+# Challenge-config tool names for server-side web access. Codex exposes both
+# WebSearch and WebFetch through its single native web_search tool.
+WEB_TOOLS = {"WebSearch", "WebFetch"}
+
 
 class Agent:
     def __init__(self, container_name):
         self.container_name = container_name
         self.model = None
         self.sessions_dir = tempfile.mkdtemp(prefix="revbench-codex-sessions-")
+        # Set by the harness when the selected web track or challenge config
+        # withholds server-side tools.
+        self.disallowed_tools = []
 
     ENV = {"CODEX_UNSAFE_ALLOW_NO_SANDBOX": "1"}
 
@@ -89,6 +96,11 @@ class Agent:
         env_flags = []
         for k, v in self.ENV.items():
             env_flags += ["-e", f"{k}={v}"]
+        model_flags = []
+        # Native web search happens on Codex's servers, outside the container
+        # network. Disable it explicitly for closed-book runs.
+        if set(self.disallowed_tools) & WEB_TOOLS:
+            model_flags += ["--strict-config", "--config", 'web_search="disabled"']
         proc = subprocess.Popen(
             ["docker", "exec", "-i"]
             + env_flags
@@ -96,6 +108,9 @@ class Agent:
                 self.container_name,
                 "codex",
                 "exec",
+            ]
+            + model_flags
+            + [
                 "--yolo",
                 "--json",
                 "--output-last-message",

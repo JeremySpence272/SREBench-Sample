@@ -21,6 +21,7 @@ JUDGE_SUBMISSION_PATH = "/workspace/submission"
 class Agent:
     def __init__(self, container_name):
         self.container_name = container_name
+        self.disallowed_tools = []
 
     ENV = {"IS_SANDBOX": "1"}
 
@@ -163,19 +164,22 @@ class Agent:
         env_flags = []
         for k, v in self.ENV.items():
             env_flags += ["-e", f"{k}={v}"]
+        claude_cmd = [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--dangerously-skip-permissions",
+            "--no-session-persistence",
+            "--verbose",
+        ]
+        if self.disallowed_tools:
+            claude_cmd += ["--disallowedTools", ",".join(self.disallowed_tools)]
         proc = subprocess.Popen(
             ["docker", "exec", "-i"]
             + env_flags
-            + [
-                self.container_name,
-                "claude",
-                "-p",
-                "--output-format",
-                "stream-json",
-                "--dangerously-skip-permissions",
-                "--no-session-persistence",
-                "--verbose",
-            ],
+            + [self.container_name]
+            + claude_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

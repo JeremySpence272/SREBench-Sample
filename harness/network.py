@@ -107,7 +107,7 @@ def setup_iptables(allowed_hosts):
         sys.exit(1)
 
     allowed_ips = resolve_hosts(allowed_hosts)
-    if not allowed_ips:
+    if allowed_hosts and not allowed_ips:
         print("ERROR: no IPs resolved for allowed hosts", file=sys.stderr)
         sys.exit(1)
 

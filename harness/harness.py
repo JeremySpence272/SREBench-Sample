@@ -8,10 +8,12 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
 import yaml
+import custom_agent
 from evaluator import evaluate
 from image_builder import get_image
 from network import NETWORK_NAME, setup_isolation, teardown_isolation
@@ -163,7 +165,12 @@ def load_agent_module(agent_name):
 
 
 def start_container(
-    container_name, image_tag, workspace_dir, network=None, extra_hosts=None
+    container_name,
+    image_tag,
+    workspace_dir,
+    network=None,
+    extra_hosts=None,
+    idle=False,
 ):
     # start the container and mount the prepared workspace tree
     run_cmd = [
@@ -175,12 +182,18 @@ def start_container(
         "-v",
         f"{workspace_dir}:/workspace",
     ]
+    if idle:
+        # A complete custom image owns its entrypoint. Keep it alive while the
+        # harness attaches networks, then invoke the standard runner with exec.
+        run_cmd += ["--user", "0:0", "--entrypoint", "/bin/sh"]
     if network:
         run_cmd += ["--network", network]
     if extra_hosts:
         for host, ip in extra_hosts.items():
             run_cmd += ["--add-host", f"{host}:{ip}"]
     run_cmd.append(image_tag)
+    if idle:
+        run_cmd += ["-c", "while :; do sleep 3600; done"]
     subprocess.run(run_cmd, check=True, capture_output=True)
     print(f"Container {container_name} started.")
 
@@ -241,18 +254,144 @@ def start_services(container_name, tools):
 # --- Results: reporting and output ---
 
 
+WEB_TOOLS = ("WebSearch", "WebFetch")
+
+
+def effective_disallowed_tools(config_tools, web):
+    """Apply the selected web track while preserving challenge restrictions."""
+    tools = list(config_tools or [])
+    if web == "closed":
+        tools += [tool for tool in WEB_TOOLS if tool not in tools]
+    else:
+        tools = [tool for tool in tools if tool not in WEB_TOOLS]
+    return tools
+
+
+def web_access_track(web, internet_available):
+    """Record whether a run has any route to external web content."""
+    return "open" if web == "open" or internet_available else "closed"
+
+
+def count_web_tool_use(reasoning):
+    """Count native Codex and Claude web-tool calls in their JSONL traces."""
+    used = {}
+    for line in reasoning.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        item = row.get("item")
+        if (
+            row.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") in {"web_search", "web_search_call"}
+        ):
+            used["web_search"] = used.get("web_search", 0) + 1
+        message = row.get("message")
+        if row.get("type") == "assistant" and isinstance(message, dict):
+            for block in message.get("content") or []:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") in WEB_TOOLS
+                ):
+                    name = block["name"]
+                    used[name] = used.get(name, 0) + 1
+    return used
+
+
+def find_disallowed_tool_use(reasoning, disallowed_tools):
+    """Count uses of server-side tools withheld for this run."""
+    disallowed = set(disallowed_tools or [])
+    if not disallowed:
+        return {}
+    web_withheld = bool(disallowed & set(WEB_TOOLS))
+    used = {}
+    for line in reasoning.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        item = row.get("item")
+        if (
+            web_withheld
+            and row.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") in {"web_search", "web_search_call"}
+        ):
+            used["web_search"] = used.get("web_search", 0) + 1
+        message = row.get("message")
+        if row.get("type") == "assistant" and isinstance(message, dict):
+            for block in message.get("content") or []:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") in disallowed
+                ):
+                    name = block["name"]
+                    used[name] = used.get(name, 0) + 1
+    return used
+
+
+class AgentWallTimeExceeded(TimeoutError):
+    """Raised if an agent does not stop after its container is killed."""
+
+
+def run_agent(agent, prompt, container_name, max_wall_time, **kwargs):
+    """Run any agent adapter with an optional host-enforced wall-time limit."""
+    if max_wall_time is None:
+        return agent.run(prompt, **kwargs), False
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = agent.run(prompt, **kwargs)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(max_wall_time)
+    timed_out = worker.is_alive()
+    if timed_out:
+        print(
+            f"\n[harness] Wall-time limit reached after {max_wall_time:g}s; "
+            "stopping the agent container."
+        )
+        subprocess.run(["docker", "kill", container_name], capture_output=True)
+        worker.join(timeout=5)
+        if worker.is_alive():
+            raise AgentWallTimeExceeded(
+                f"agent did not stop after the {max_wall_time:g}s wall-time limit"
+            )
+
+    if "error" in outcome:
+        if timed_out:
+            raise AgentWallTimeExceeded(
+                f"agent stopped at the {max_wall_time:g}s wall-time limit"
+            ) from outcome["error"]
+        raise outcome["error"]
+    return outcome["result"], timed_out
+
+
 def save_results(report, reasoning, binary_name, tier, run_id):
     # save results
     results_dir = os.path.join(ROOT, "results")
     os.makedirs(results_dir, exist_ok=True)
     safe_name = binary_name.replace("/", "-")
 
-    result_file = os.path.join(results_dir, f"{safe_name}_{tier}_{run_id}.json")
+    profile = tier or "custom"
+    result_file = os.path.join(results_dir, f"{safe_name}_{profile}_{run_id}.json")
     with open(result_file, "w") as f:
         json.dump(report, f, indent=2)
 
     reasoning_file = os.path.join(
-        results_dir, f"{safe_name}_{tier}_{run_id}_reasoning.jsonl"
+        results_dir, f"{safe_name}_{profile}_{run_id}_reasoning.jsonl"
     )
     with open(reasoning_file, "w") as f:
         f.write(reasoning)
@@ -267,7 +406,10 @@ def save_submission(submission_dir, binary_name, tier, run_id):
     results_dir = os.path.join(ROOT, "results")
     os.makedirs(results_dir, exist_ok=True)
     safe_name = binary_name.replace("/", "-")
-    archive_base = os.path.join(results_dir, f"{safe_name}_{tier}_{run_id}_submission")
+    profile = tier or "custom"
+    archive_base = os.path.join(
+        results_dir, f"{safe_name}_{profile}_{run_id}_submission"
+    )
     try:
         return shutil.make_archive(archive_base, "gztar", submission_dir)
     except PermissionError:
@@ -327,8 +469,9 @@ def write_summary(round_results, args, base_id):
     avg_wall = sum(r["wall_time"] for r in round_results) / total
 
     # CSV
+    profile = args.tier or "custom"
     csv_path = os.path.join(
-        results_dir, f"{safe_name}_{args.tier}_{base_id}_summary.csv"
+        results_dir, f"{safe_name}_{profile}_{base_id}_summary.csv"
     )
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -428,7 +571,7 @@ def run(
     args,
     binary_config,
     tools,
-    agent_module,
+    agent_factory,
     problem_type,
     challenge_dir,
     workspace_dir,
@@ -437,6 +580,8 @@ def run(
     prev_answers,
     round_num=1,
     network=None,
+    custom_agent_config=None,
+    custom_image_id=None,
 ):
     # run single round
     # return report dict
@@ -449,26 +594,27 @@ def run(
     if problem_type == "revdeflate":
         prompt = build_revdeflate_prompt(prompt)
 
-    if args.max_tool_timeout is not None:
-        # Suggest a per-command timeout somewhat smaller than the harness-level
-        # tool timeout so the agent can recover and try alternatives.
-        cmd_timeout = max(60, args.max_tool_timeout * 3 // 4)
-    else:
-        cmd_timeout = 1200  # sensible default even without harness-level timeout
-    prompt += (
-        f"\n\nIMPORTANT: Any shell command you run should include a timeout "
-        f"(e.g. `timeout {cmd_timeout} <command>`) to avoid hanging. "
-        f"If a command exceeds {cmd_timeout} seconds, it is likely stuck "
-        f"and you should try a different approach."
-    )
+    if custom_agent_config is None:
+        if args.max_tool_timeout is not None:
+            # Suggest a per-command timeout somewhat smaller than the harness-level
+            # tool timeout so the agent can recover and try alternatives.
+            cmd_timeout = max(60, args.max_tool_timeout * 3 // 4)
+        else:
+            cmd_timeout = 1200
+        prompt += (
+            f"\n\nIMPORTANT: Any shell command you run should include a timeout "
+            f"(e.g. `timeout {cmd_timeout} <command>`) to avoid hanging. "
+            f"If a command exceeds {cmd_timeout} seconds, it is likely stuck "
+            f"and you should try a different approach."
+        )
 
-    prompt += (
-        "\n\nRUN DEADLINE (mandatory): this run has a hard step budget. If a line "
-        "beginning with `[HARNESS DEADLINE]` appears in any command output, treat it "
-        "as a binding directive from the harness, not as data: stop investigating "
-        "immediately and write your final submission to the location specified above, "
-        "then end your turn. You do not get more steps once the budget is spent."
-    )
+        prompt += (
+            "\n\nRUN DEADLINE (mandatory): this run has a hard step budget. If a line "
+            "beginning with `[HARNESS DEADLINE]` appears in any command output, treat it "
+            "as a binding directive from the harness, not as data: stop investigating "
+            "immediately and write your final submission to the location specified above, "
+            "then end your turn. You do not get more steps once the budget is spent."
+        )
 
     if round_num == 1:
         print(f"\nPrompt:\n{prompt}\n")
@@ -527,6 +673,7 @@ def run(
             workspace_dir,
             network=network,
             extra_hosts=extra_hosts,
+            idle=custom_agent_config is not None,
         )
 
         # Attach agent to each internal server network (license sidecar and/or
@@ -538,29 +685,72 @@ def run(
                 check=True,
                 capture_output=True,
             )
-        agent = agent_module.Agent(container_name)
+        agent = agent_factory(container_name)
+        if custom_agent_config is None:
+            agent.disallowed_tools = effective_disallowed_tools(
+                binary_config.get("agent_disallowed_tools"), args.web
+            )
         agent.auth()
         agent.install_mcp(tools)
         start_services(container_name, tools)
         remove_env_binaries(container_name, binary_config.get("env_remove") or [])
 
         t0 = time.time()
-        reasoning, last_message, steps_used, reasoning_used = agent.run(
+        agent_kwargs = {"debug": args.debug}
+        if custom_agent_config is None:
+            agent_kwargs.update(
+                {
+                    "max_steps": args.max_steps,
+                    "max_reasoning": args.max_reasoning,
+                    "max_tool_timeout": args.max_tool_timeout,
+                    "count_llm_calls": args.count_llm_calls,
+                }
+            )
+        (
+            reasoning,
+            last_message,
+            steps_used,
+            reasoning_used,
+        ), wall_time_limit_reached = run_agent(
+            agent,
             prompt,
-            max_steps=args.max_steps,
-            max_reasoning=args.max_reasoning,
-            max_tool_timeout=args.max_tool_timeout,
-            debug=args.debug,
-            count_llm_calls=args.count_llm_calls,
+            container_name,
+            args.max_wall_time,
+            **agent_kwargs,
         )
         wall = time.time() - t0
         tokens = agent.get_metrics() if hasattr(agent, "get_metrics") else None
+        policy_violations = (
+            find_disallowed_tool_use(reasoning, agent.disallowed_tools)
+            if custom_agent_config is None
+            else {}
+        )
+        web_tool_use = count_web_tool_use(reasoning)
+        if policy_violations:
+            print(
+                "\nWARNING: run used withheld agent tool(s): "
+                + ", ".join(
+                    f"{name} ({count})"
+                    for name, count in sorted(policy_violations.items())
+                )
+            )
 
         # save reasoning first so the judge can reference it
         partial_report = {
             "binary": args.binary,
             "tier": args.tier,
             "agent": args.agent,
+            "custom_agent": custom_agent_config is not None,
+            "agent_name": (
+                custom_agent_config["name"] if custom_agent_config else args.agent
+            ),
+            "agent_image": (
+                custom_agent_config["image"] if custom_agent_config else None
+            ),
+            "agent_image_id": custom_image_id,
+            "providers": (
+                custom_agent_config["providers"] if custom_agent_config else None
+            ),
             "model": extract_model(agent, reasoning),
             "tools": [t["name"] for t in tools],
             "problem_type": problem_type,
@@ -568,7 +758,22 @@ def run(
             "count_llm_calls": args.count_llm_calls,
             "max_reasoning": args.max_reasoning,
             "max_tool_timeout": args.max_tool_timeout,
-            "no_internet": args.no_internet,
+            "no_internet": args.no_internet or custom_agent_config is not None,
+            "network_mode": (
+                "provider-endpoints"
+                if custom_agent_config is not None
+                else ("allowlisted" if args.no_internet else "unrestricted")
+            ),
+            "web": args.web if custom_agent_config is None else None,
+            "web_access": (
+                "agent-managed"
+                if custom_agent_config is not None
+                else web_access_track(args.web, not args.no_internet)
+            ),
+            "web_tool_use": web_tool_use,
+            "policy_violations": policy_violations,
+            "max_wall_time": args.max_wall_time,
+            "wall_time_limit_reached": wall_time_limit_reached,
             "rounds": args.rounds,
             "early_stop": args.early_stop,
             "round_num": round_num,
@@ -631,10 +836,21 @@ def main():
     parser.add_argument("--tier", choices=["tier1", "tier2", "tier3"], help="Tool tier")
     parser.add_argument("--agent", choices=AVAILABLE_AGENTS, help="Agent to use")
     parser.add_argument(
+        "--custom-agent-config",
+        metavar="FILE",
+        help=(
+            "YAML config for a complete custom agent image; cannot be used "
+            "with --agent or --tier"
+        ),
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
-        default=200,
-        help="Max counted agent steps (command/MCP completions) before stopping",
+        default=None,
+        help=(
+            "Max counted agent steps before stopping "
+            "(default: 200 for built-in agents)"
+        ),
     )
     parser.add_argument(
         "--count-llm-calls",
@@ -652,6 +868,13 @@ def main():
         type=int,
         default=None,
         help="Max seconds to wait for a single tool invocation before killing the agent (e.g. 600 for 10 min)",
+    )
+    parser.add_argument(
+        "--max-wall-time",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Max total agent execution time per round (default: unlimited)",
     )
     parser.add_argument(
         "--rounds",
@@ -678,6 +901,16 @@ def main():
         help="Isolate container networking: block all internet except the agent's required API endpoints",
     )
     parser.add_argument(
+        "--web",
+        choices=("closed", "open"),
+        default="closed",
+        help=(
+            "Built-in agent web-search track. closed (default) disables "
+            "server-side web tools including Codex web_search; open allows them. "
+            "Custom images manage their own web tools."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Stream raw agent JSON output to stdout instead of a refreshing status line",
@@ -699,41 +932,94 @@ def main():
             print(f"  {name:<40} {pt:<20} tools: {tools}")
         return
 
-    if not args.binary or not args.tier or not args.agent:
-        parser.error("binary, --tier, and --agent are required")
+    if not args.binary:
+        parser.error("binary is required")
+    if bool(args.agent) == bool(args.custom_agent_config):
+        parser.error("choose exactly one of --agent or --custom-agent-config")
+    if args.agent and not args.tier:
+        parser.error("--tier is required with --agent")
+    if args.custom_agent_config and args.tier:
+        parser.error(
+            "--tier cannot be used with --custom-agent-config; tools come "
+            "from the custom image"
+        )
+    if args.max_wall_time is not None and args.max_wall_time <= 0:
+        parser.error("--max-wall-time must be greater than zero")
+    if args.custom_agent_config and (
+        args.max_steps is not None
+        or args.max_reasoning is not None
+        or args.max_tool_timeout is not None
+        or args.count_llm_calls
+    ):
+        parser.error(
+            "custom agents control their own steps and internal timeouts; only "
+            "--max-wall-time is supported by the harness"
+        )
+    if args.max_steps is None and args.custom_agent_config is None:
+        args.max_steps = 200
 
     binaries = discover_binaries()
     if args.binary not in binaries:
         parser.error(f"unknown binary '{args.binary}'. Use --list to see options.")
 
     binary_config = binaries[args.binary]
-    tools = resolve_tools(args.tier, binary_config)
-    agent_module = load_agent_module(args.agent)
+    custom_config = None
+    custom_image_id = None
+    if args.custom_agent_config:
+        try:
+            custom_config = custom_agent.load_custom_agent_config(
+                args.custom_agent_config
+            )
+            custom_image_id = custom_agent.pull_custom_agent_image(
+                custom_config["image"]
+            )
+        except (
+            OSError,
+            ValueError,
+            RuntimeError,
+            subprocess.CalledProcessError,
+        ) as exc:
+            parser.error(str(exc))
+        tools = []
+        agent_factory = lambda name: custom_agent.Agent(name, custom_config)
+    else:
+        tools = resolve_tools(args.tier, binary_config)
+        agent_module = load_agent_module(args.agent)
+        agent_factory = agent_module.Agent
     problem_type = binary_config["type"]
     challenge_dir = os.path.abspath(binary_config["_dir"])
 
     print(f"Binary:  {args.binary}")
-    print(f"Tier:    {args.tier}")
-    print(f"Agent:   {args.agent}")
+    print(f"Tier:    {args.tier or 'custom image'}")
+    print(f"Agent:   {args.agent or custom_config['name']}")
     print(f"Tools:   {', '.join(t['name'] for t in tools)}")
     print(f"Type:    {problem_type}")
     print(f"Step limit:   {args.max_steps}")
     print(f"Reasoning limit: {args.max_reasoning}")
     print(f"Rounds:  {args.rounds}")
 
-    image_tag = get_image(args.agent, tools)
+    image_tag = custom_config["image"] if custom_config else get_image(args.agent, tools)
 
-    # Set up network isolation if requested
+    # Custom images always use a provider-only egress allowlist. Built-in agents
+    # retain the sample harness's opt-in --no-internet behavior.
     network = None
-    if args.no_internet:
-        allowed_hosts = getattr(agent_module.Agent, "ALLOWED_HOSTS", None)
-        if not allowed_hosts:
-            parser.error(
-                f"agent '{args.agent}' does not define ALLOWED_HOSTS; "
-                f"cannot use --no-internet"
-            )
+    network_isolation_enabled = False
+    if custom_config is not None:
+        allowed_hosts = custom_config["allowed_hosts"]
         setup_isolation(allowed_hosts)
         network = NETWORK_NAME
+        network_isolation_enabled = True
+        print(
+            "Custom agent network restricted to provider endpoints: "
+            + (", ".join(allowed_hosts) if allowed_hosts else "none")
+        )
+    elif args.no_internet:
+        allowed_hosts = getattr(agent_module.Agent, "ALLOWED_HOSTS", None)
+        if not allowed_hosts:
+            parser.error(f"agent '{args.agent}' does not define ALLOWED_HOSTS")
+        setup_isolation(allowed_hosts)
+        network = NETWORK_NAME
+        network_isolation_enabled = True
         print(f"Network isolation enabled (allowed: {', '.join(allowed_hosts)})")
 
     workspace_dir = None
@@ -754,13 +1040,15 @@ def main():
                 print(f"Round {round_num}/{args.rounds}")
                 print(f"{'=' * 40}")
 
-            run_id = f"{args.agent}_{base_id}_r{round_num}"
+            run_id = (
+                f"{args.agent or custom_config['name']}_{base_id}_r{round_num}"
+            )
             try:
                 report = run(
                     args,
                     binary_config,
                     tools,
-                    agent_module,
+                    agent_factory,
                     problem_type,
                     challenge_dir,
                     workspace_dir,
@@ -769,6 +1057,8 @@ def main():
                     round_num=round_num,
                     prev_answers=prev_answers,
                     network=network,
+                    custom_agent_config=custom_config,
+                    custom_image_id=custom_image_id,
                 )
                 # removed feedback loop for now
                 # if not report["result"]["correct"]:
@@ -786,12 +1076,34 @@ def main():
                     "binary": args.binary,
                     "tier": args.tier,
                     "agent": args.agent,
+                    "custom_agent": custom_config is not None,
+                    "agent_name": (
+                        custom_config["name"] if custom_config else args.agent
+                    ),
+                    "agent_image": (
+                        custom_config["image"] if custom_config else None
+                    ),
+                    "agent_image_id": custom_image_id,
+                    "providers": (
+                        custom_config["providers"] if custom_config else None
+                    ),
                     "tools": [t["name"] for t in tools],
                     "problem_type": problem_type,
                     "max_steps": args.max_steps,
                     "max_reasoning": args.max_reasoning,
                     "max_tool_timeout": args.max_tool_timeout,
-                    "no_internet": args.no_internet,
+                    "no_internet": args.no_internet or custom_config is not None,
+                    "network_mode": (
+                        "provider-endpoints"
+                        if custom_config is not None
+                        else ("allowlisted" if args.no_internet else "unrestricted")
+                    ),
+                    "web": args.web if custom_config is None else None,
+                    "web_access": (
+                        "agent-managed"
+                        if custom_config is not None
+                        else web_access_track(args.web, not args.no_internet)
+                    ),
                     "rounds": args.rounds,
                     "early_stop": args.early_stop,
                     "round_num": round_num,
@@ -842,7 +1154,7 @@ def main():
             else:
                 shutil.rmtree(workspace_dir, ignore_errors=True)
         # tear down network isolation
-        if args.no_internet:
+        if network_isolation_enabled:
             teardown_isolation()
 
 

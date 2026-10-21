@@ -7,7 +7,7 @@ A single-domain reverse-engineering benchmark: a coding agent is given a strippe
 - Python 3
 - Docker (running)
 - `pip install -r requirements.txt`  (pyyaml, pytest)
-- An agent configured on the host: a working `~/.codex/`, `~/.claude/`, or `~/.gemini/`.
+- A host-configured built-in agent (`~/.codex/`, `~/.claude/`, or `~/.gemini/`), or a custom agent image.
 
 ## Usage
 
@@ -29,6 +29,19 @@ Example:
 python3 harness/harness.py revdeflate/c-opt-sym-static --agent codex --tier tier2
 ```
 
+Codex's server-side web search is disabled by default. Use `--web open` to
+allow built-in web tools, including Codex `web_search`.
+
+Run a complete custom image with its own agent and tools:
+
+```bash
+python3 harness/harness.py revdeflate/c-opt-sym-static \
+  --custom-agent-config custom-agent.yaml
+```
+
+See [docs/custom-agents.md](docs/custom-agents.md) for the image and runner
+contract.
+
 ## Arguments
 
 | Arg | Description |
@@ -43,6 +56,9 @@ python3 harness/harness.py revdeflate/c-opt-sym-static --agent codex --tier tier
 | `--max-tool-timeout N` | Max seconds for a single tool call before the agent is killed |
 | `--count-llm-calls` | Count LLM API calls toward `--max-steps` instead of tool calls |
 | `--no-internet` | Block all container networking except the agent's required API endpoints |
+| `--web open` | Allow built-in server-side web tools; closed is the default |
+| `--custom-agent-config FILE` | Run a complete custom agent image; cannot be combined with `--agent` or `--tier` |
+| `--max-wall-time N` | Stop any agent after N seconds in a round |
 | `--keep-workspace` | Keep the run's workspace directory and print its path |
 | `--debug` | Stream raw agent output instead of the refreshing status line |
 | `--list-binaries` | List challenges and exit |
