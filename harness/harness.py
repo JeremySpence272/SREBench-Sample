@@ -706,6 +706,9 @@ def run(
                     "count_llm_calls": args.count_llm_calls,
                 }
             )
+            if args.resume_on_flag:
+                agent_kwargs["resume_on_flag"] = args.resume_on_flag
+                agent_kwargs["resume_drop_steps"] = args.resume_drop_steps
         (
             reasoning,
             last_message,
@@ -752,6 +755,8 @@ def run(
                 custom_agent_config["providers"] if custom_agent_config else None
             ),
             "model": extract_model(agent, reasoning),
+            "resume_on_flag": args.resume_on_flag,
+            "resume_drop_steps": args.resume_drop_steps,
             "tools": [t["name"] for t in tools],
             "problem_type": problem_type,
             "max_steps": args.max_steps,
@@ -857,6 +862,17 @@ def main():
         action="store_true",
         help="Count LLM API invocations toward --max-steps instead of tool calls",
     )
+    # Undocumented, codex only. --resume-on-flag [N]: when the provider's cybersecurity
+    # filter ends a turn, resume the same thread up to N times (50 when given bare, off
+    # by default). --resume-drop-steps K: drop the flagged turn's last K tool steps
+    # before resuming (default 1; 0 keeps the thread intact).
+    parser.add_argument(
+        "--resume-on-flag", type=int, nargs="?", const=50, default=0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--resume-drop-steps", type=int, default=1, help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--max-reasoning",
         type=int,
@@ -945,6 +961,8 @@ def main():
         )
     if args.max_wall_time is not None and args.max_wall_time <= 0:
         parser.error("--max-wall-time must be greater than zero")
+    if args.resume_on_flag and args.agent != "codex":
+        parser.error("--resume-on-flag requires --agent codex")
     if args.custom_agent_config and (
         args.max_steps is not None
         or args.max_reasoning is not None
@@ -1087,6 +1105,8 @@ def main():
                     "providers": (
                         custom_config["providers"] if custom_config else None
                     ),
+                    "resume_on_flag": args.resume_on_flag,
+                    "resume_drop_steps": args.resume_drop_steps,
                     "tools": [t["name"] for t in tools],
                     "problem_type": problem_type,
                     "max_steps": args.max_steps,
